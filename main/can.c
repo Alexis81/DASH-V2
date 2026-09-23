@@ -36,6 +36,12 @@ static uint16_t read_be16(const uint8_t *data)
     return ((uint16_t)data[0] << 8) | data[1];
 }
 
+/* Brut CAN uint8 − 50 °C, en arithmétique signée (brut 20 → −30, pas 226). */
+static int16_t temp_c_from_raw(uint8_t raw)
+{
+    return (int16_t)((int)raw - 50);
+}
+
 static void decode_frame(const can_frame_t *frame)
 {
     can_data_t next;
@@ -48,10 +54,10 @@ static void decode_frame(const can_frame_t *frame)
     case CAN_ID_ENGINE:
         next.rpm = read_be16(&frame->data[0]);
         next.manifold_kpa = (int32_t)read_be16(&frame->data[2]) - 100;
-        next.ect_c = (int16_t)frame->data[4] - 50;
-        next.iat_c = (int16_t)frame->data[5] - 50;
+        next.ect_c = temp_c_from_raw(frame->data[4]);
+        next.iat_c = temp_c_from_raw(frame->data[5]);
         next.ecu_volts = frame->data[6] * 0.1f;
-        next.oil_temp_c = (int16_t)frame->data[7] - 50;
+        next.oil_temp_c = temp_c_from_raw(frame->data[7]);
         next.engine_valid = true;
         break;
     case CAN_ID_STATUS:
@@ -60,7 +66,7 @@ static void decode_frame(const can_frame_t *frame)
         next.speed = frame->data[4];
         next.oil_pressure = frame->data[5];
         next.fuel_pressure = frame->data[6];
-        next.ecu_temp_c = (int16_t)frame->data[7] - 50;
+        next.ecu_temp_c = temp_c_from_raw(frame->data[7]);
         next.status_valid = true;
         break;
     case CAN_ID_LAMBDA:

@@ -99,7 +99,7 @@ class Engine:
 
     def set_rpm_mode(self, mode: str, value: float | None = None) -> None:
         with self._lock:
-            if mode not in ("auto", "manual"):
+            if mode not in ("auto", "manual", "accel"):
                 raise ValueError("mode régime invalide")
             if mode == "manual":
                 if value is None:
@@ -205,8 +205,10 @@ class Engine:
     def step(self, dt: float) -> dict[str, float]:
         with self._lock:
             self.t += dt
-            cycle = self.t % 40.0
-            pedal, running, cranking = self._pedal(cycle)
+            if self.rpm_mode == "accel":
+                pedal, running, cranking = self._pedal_accel()
+            else:
+                pedal, running, cranking = self._pedal(self.t % 40.0)
             self.running = running
             rpm_manual = self.rpm_mode == "manual"
             ect_manual = self.ect_mode == "manual"
@@ -224,12 +226,20 @@ class Engine:
                     target_rpm = 260.0
                 elif running:
                     target_rpm = 820.0 + pedal * (RPM_MAX - 820.0)
-                tau = 0.45 if target_rpm >= self.rpm else 0.8
+                # Accélérations : montée plus vive pour atteindre RPM_MAX pendant le palier.
+                if self.rpm_mode == "accel":
+                    tau = 0.22 if target_rpm >= self.rpm else 0.55
+                else:
+                    tau = 0.45 if target_rpm >= self.rpm else 0.8
                 self.rpm += (target_rpm - self.rpm) * min(1.0, dt / tau)
+                if self.rpm_mode == "accel" and pedal >= 0.99 and abs(target_rpm - self.rpm) < 40.0:
+                    self.rpm = target_rpm
                 if running and pedal < 0.04:
                     self.rpm += 12.0 * math.sin(self.t * 18.0)
                 self.rpm = clamp(self.rpm, 0.0, RPM_MAX)
-                self._shift(pedal)
+                # Pas de passage de rapport en Accélérations : sinon coupe à RPM_SHIFT (~7300).
+                if self.rpm_mode != "accel":
+                    self._shift(pedal)
 
             self._speed(dt, pedal)
             if ect_manual:
@@ -320,6 +330,28 @@ class Engine:
                 mix = 0.0 if span == 0.0 else (cycle - t0) / span
                 pedal = p0 + (p1 - p0) * mix
                 break
+        return clamp(pedal, 0.0, 1.0), True, False
+
+    def _pedal_accel(self) -> tuple[float, bool, bool]:
+        """Série d'accélérations 0→100 %→palier→0, en boucle (moteur déjà lancé).
+
+        Le palier à fond doit être assez long pour que le régime atteigne RPM_MAX
+        et que l'afficheur (lissage ~40 ms) montre le rideau à fond.
+        """
+        press = 0.9
+        hold = 2.2
+        release = 1.0
+        rest = 0.6
+        period = press + hold + release + rest
+        phase = self.t % period
+        if phase < press:
+            pedal = phase / press
+        elif phase < press + hold:
+            pedal = 1.0
+        elif phase < press + hold + release:
+            pedal = 1.0 - (phase - press - hold) / release
+        else:
+            pedal = 0.0
         return clamp(pedal, 0.0, 1.0), True, False
 
     def _shift(self, pedal: float) -> None:
@@ -632,7 +664,7 @@ UI_HTML = """<!DOCTYPE html>
 <body>
 <main>
   <h1>Simulateur moteur</h1>
-  <p class="sub">Régime, eau, lambda, air moteur et papillon — modes auto / manuel indépendants</p>
+  <p class="sub">Régime, eau, lambda, air moteur et papillon — modes auto / accélérations / manuel indépendants</p>
   <div id="err" class="err"></div>
   <div class="conn">
     <div id="dot" class="dot"></div>
@@ -667,11 +699,12 @@ UI_HTML = """<!DOCTYPE html>
     <h2>Régime moteur</h2>
     <div class="modes">
       <button type="button" id="rpm-auto" class="active">Automatique</button>
+      <button type="button" id="rpm-accel">Accélérations</button>
       <button type="button" id="rpm-manual">Manuel</button>
     </div>
     <label class="slider-label"><span>Curseur manuel</span><span id="rpm-label">0 tr/min</span></label>
     <input type="range" id="rpm-slider" min="0" max="7500" step="50" value="0" disabled>
-    <p class="hint">En manuel : valeur fixe 0–7500 tr/min, sans passage de rapport.</p>
+    <p class="hint">Auto : scénario 40 s. Accélérations : pédale 0→100 %→0 en boucle. Manuel : 0–7500 tr/min fixe, sans rapports.</p>
   </div>
   <div class="card">
     <h2>Water</h2>
@@ -694,7 +727,7 @@ UI_HTML = """<!DOCTYPE html>
     <p class="hint">En manuel : 0,70–1,30 (afficheur : &lt; 0,95 rouge, &gt; 1,2 bleu).</p>
   </div>
   <div class="card">
-    <h2>Air Motor</h2>
+    <h2>Air Temp</h2>
     <div class="modes">
       <button type="button" id="iat-auto" class="active">Automatique</button>
       <button type="button" id="iat-manual">Manuel</button>
@@ -716,6 +749,7 @@ UI_HTML = """<!DOCTYPE html>
 </main>
 <script>
 const rpmAuto = document.getElementById("rpm-auto");
+const rpmAccel = document.getElementById("rpm-accel");
 const rpmManual = document.getElementById("rpm-manual");
 const rpmSlider = document.getElementById("rpm-slider");
 const rpmLabel = document.getElementById("rpm-label");
@@ -760,11 +794,13 @@ function showErr(msg) {
 
 function syncUi(s) {
   const rpmMan = s.rpm_mode === "manual";
+  const rpmAcc = s.rpm_mode === "accel";
   const ectMan = s.ect_mode === "manual";
   const lambdaMan = s.lambda_mode === "manual";
   const iatMan = s.iat_mode === "manual";
   const tpsMan = s.tps_mode === "manual";
-  rpmAuto.classList.toggle("active", !rpmMan);
+  rpmAuto.classList.toggle("active", s.rpm_mode === "auto");
+  rpmAccel.classList.toggle("active", rpmAcc);
   rpmManual.classList.toggle("active", rpmMan);
   ectAuto.classList.toggle("active", !ectMan);
   ectManual.classList.toggle("active", ectMan);
@@ -848,6 +884,7 @@ async function poll() {
 }
 
 rpmAuto.onclick = () => postControl({ rpm_mode: "auto" });
+rpmAccel.onclick = () => postControl({ rpm_mode: "accel" });
 rpmManual.onclick = () => postControl({ rpm_mode: "manual" });
 ectAuto.onclick = () => postControl({ ect_mode: "auto" });
 ectManual.onclick = () => postControl({ ect_mode: "manual" });

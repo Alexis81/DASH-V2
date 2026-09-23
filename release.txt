@@ -1,0 +1,11 @@
+**Nouveautes**
+
+Version 1.0.0
+
+- Affiche la version `v1.0.0` en bas à gauche du splash (logo Toyota)
+- Skill Cursor `commit` : release.txt, bump version, commit, push, flash
+- Réglages : luminosité LED, vitesse du rideau rouge, titre Parameters
+- Affichage AFR (bascule Lambda/AFR) et alerte eau « HOT WATER »
+- RPM 280 px, rafraîchissement UI ~50 Hz (rideau plus fluide)
+- Simulateur : mode Accélérations ; script `installer-mac.command`
+- Correction décodage températures CAN (valeurs négatives)

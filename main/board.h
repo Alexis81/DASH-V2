@@ -57,3 +57,5 @@
 #define BOARD_LVGL_TICK_PERIOD_MS 2
 #define BOARD_LVGL_TASK_STACK 8192
 #define BOARD_LVGL_TASK_PRIORITY 2
+/* ~50 Hz UI/LEDs: smoother than 40 ms without flooding FULL-mode PSRAM flushes. */
+#define BOARD_UI_PERIOD_MS 20

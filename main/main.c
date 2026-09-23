@@ -19,6 +19,8 @@
 #include "nvs.h"
 #include "nvs_flash.h"
 
+#define APP_VERSION "1.0.0"
+
 extern const lv_font_t rpm_font;
 extern const lv_font_t stop_font;
 
@@ -36,13 +38,21 @@ static bool s_settings_dirty;
 #define ECT_STOP_DEF 110
 #define LAMBDA_RICH 0.95f
 #define LAMBDA_LEAN 1.2f
+#define AFR_STOICH 14.7f
 #define STOP_BLINK_MS 500
-#define RED_BLINK_MS 80
+#define RED_BLINK_DEF 80
+#define RED_BLINK_MIN 40
+#define RED_BLINK_MAX 400
+#define RED_BLINK_STEP 40
+#define LED_BRIGHTNESS_DEF 25
+#define LED_BRIGHTNESS_MIN 1
+#define LED_BRIGHTNESS_MAX 255
+#define LED_BRIGHTNESS_STEP 5
 #define BOTTOM_BAND_H 120
 #define TITLE_BAND_Y ((BOARD_LCD_V_RES / 2) + 122)
 #define TITLE_BAND_H 39
 #define SEP_LINE_COUNT 5
-#define SET_ROW_COUNT 4
+#define SET_ROW_COUNT 6
 
 typedef struct {
     uint16_t *val;
@@ -84,6 +94,8 @@ static int16_t s_iat_drawn = INT16_MIN;
 static float s_lambda_drawn = -1.0f;
 static float s_tps_drawn = -1.0f;
 static bool s_lambda_valid_drawn;
+static bool s_show_afr;
+static bool s_show_afr_drawn;
 static bool s_engine_valid_drawn;
 static int32_t s_rpm_green_px;
 static int32_t s_rpm_yellow_px;
@@ -94,6 +106,8 @@ static uint16_t s_rpm_end_g = RPM_GREEN_DEF;
 static uint16_t s_rpm_end_y = RPM_YELLOW_DEF;
 static uint16_t s_rpm_end_r = RPM_MAX_DEF;
 static uint16_t s_ect_stop = ECT_STOP_DEF;
+static uint16_t s_red_blink_ms = RED_BLINK_DEF;
+static uint16_t s_led_brightness = LED_BRIGHTNESS_DEF;
 static bool s_leds_enabled = true;
 static lv_obj_t *s_leds_lbl;
 static set_row_t s_set_rows[SET_ROW_COUNT];
@@ -142,7 +156,7 @@ static void rpm_curtain_apply(uint16_t rpm)
     if (s_rpm_label != NULL && rpm != s_rpm_drawn) {
         s_rpm_drawn = rpm;
         lv_label_set_text_fmt(s_rpm_label, "%u", rpm);
-        lv_obj_align(s_rpm_label, LV_ALIGN_CENTER, -1, -64);
+        lv_obj_align(s_rpm_label, LV_ALIGN_CENTER, -1, -58);
         lv_obj_move_foreground(s_rpm_label);
     }
 }
@@ -163,8 +177,8 @@ static void rpm_red_blink_update(uint16_t rpm)
         return;
     }
 
-    s_red_blink_elapsed += 40;
-    on = (s_red_blink_elapsed / RED_BLINK_MS) % 2 == 0;
+    s_red_blink_elapsed += BOARD_UI_PERIOD_MS;
+    on = (s_red_blink_elapsed / s_red_blink_ms) % 2 == 0;
     if (on == s_red_blink_lit) {
         return;
     }
@@ -222,13 +236,18 @@ static void bottom_apply(const can_data_t *data)
         return;
     }
 
-    if (data->lambda_valid != s_lambda_valid_drawn ||
+    if (data->lambda_valid != s_lambda_valid_drawn || s_show_afr != s_show_afr_drawn ||
         (data->lambda_valid && data->lambda1 != s_lambda_drawn)) {
         s_lambda_valid_drawn = data->lambda_valid;
+        s_show_afr_drawn = s_show_afr;
         s_lambda_drawn = data->lambda_valid ? data->lambda1 : -1.0f;
         if (!data->lambda_valid) {
-            lv_label_set_text(s_lambda_value, "-.--");
+            lv_label_set_text(s_lambda_value, s_show_afr ? "--.-" : "-.--");
             lv_obj_set_style_text_color(s_lambda_value, lv_color_white(), 0);
+        } else if (s_show_afr) {
+            snprintf(buf, sizeof(buf), "%.1f", data->lambda1 * AFR_STOICH);
+            lv_label_set_text(s_lambda_value, buf);
+            lv_obj_set_style_text_color(s_lambda_value, lambda_color(data->lambda1), 0);
         } else {
             snprintf(buf, sizeof(buf), "%.2f", data->lambda1);
             lv_label_set_text(s_lambda_value, buf);
@@ -320,7 +339,7 @@ static void stop_engine_blink(void)
 {
     bool on;
 
-    s_stop_elapsed += 40;
+    s_stop_elapsed += BOARD_UI_PERIOD_MS;
     on = (s_stop_elapsed / STOP_BLINK_MS) % 2 == 0;
     if (on == s_stop_lit) {
         return;
@@ -381,8 +400,10 @@ static void settings_set_open(bool open)
     }
     if (open) {
         lv_obj_move_foreground(s_settings);
+        leds_set_preview(true);
         return;
     }
+    leds_set_preview(false);
     can_get_data(&data);
     if (stop_engine_needed(&data)) {
         if (s_stop_active) {
@@ -426,6 +447,18 @@ static void settings_clamp_ordered(void)
     if (s_rpm_end_g + 100 > s_rpm_end_y) {
         s_rpm_end_g = (uint16_t)(s_rpm_end_y - 100);
     }
+    if (s_red_blink_ms < RED_BLINK_MIN) {
+        s_red_blink_ms = RED_BLINK_MIN;
+    }
+    if (s_red_blink_ms > RED_BLINK_MAX) {
+        s_red_blink_ms = RED_BLINK_MAX;
+    }
+    if (s_led_brightness < LED_BRIGHTNESS_MIN) {
+        s_led_brightness = LED_BRIGHTNESS_MIN;
+    }
+    if (s_led_brightness > LED_BRIGHTNESS_MAX) {
+        s_led_brightness = LED_BRIGHTNESS_MAX;
+    }
 }
 
 static void settings_save(void)
@@ -438,7 +471,9 @@ static void settings_save(void)
     nvs_set_u16(h, "y", s_rpm_end_y);
     nvs_set_u16(h, "r", s_rpm_end_r);
     nvs_set_u16(h, "e", s_ect_stop);
+    nvs_set_u16(h, "b", s_red_blink_ms);
     nvs_set_u8(h, "led", s_leds_enabled ? 1 : 0);
+    nvs_set_u8(h, "lb", (uint8_t)s_led_brightness);
     nvs_commit(h);
     nvs_close(h);
     s_settings_dirty = false;
@@ -453,6 +488,7 @@ static void settings_load(void)
     nvs_handle_t h;
     uint16_t v;
     uint8_t led;
+    uint8_t lb;
     if (nvs_open("dash", NVS_READONLY, &h) != ESP_OK) {
         return;
     }
@@ -468,8 +504,14 @@ static void settings_load(void)
     if (nvs_get_u16(h, "e", &v) == ESP_OK) {
         s_ect_stop = v;
     }
+    if (nvs_get_u16(h, "b", &v) == ESP_OK) {
+        s_red_blink_ms = v;
+    }
     if (nvs_get_u8(h, "led", &led) == ESP_OK) {
         s_leds_enabled = led != 0;
+    }
+    if (nvs_get_u8(h, "lb", &lb) == ESP_OK) {
+        s_led_brightness = lb;
     }
     nvs_close(h);
     settings_clamp_ordered();
@@ -499,6 +541,9 @@ static void settings_btn_cb(lv_event_t *e)
     settings_clamp_ordered();
     settings_rows_refresh();
     s_settings_dirty = true;
+    if (row->val == &s_led_brightness) {
+        leds_set_brightness((uint8_t)s_led_brightness);
+    }
     rpm_curtain_apply(s_rpm_shown);
     rpm_red_blink_update(s_rpm_shown);
 }
@@ -587,28 +632,31 @@ static void settings_build(lv_obj_t *screen)
     lv_obj_set_hidden(s_settings, true);
 
     title = lv_label_create(s_settings);
-    lv_label_set_text(title, "Reglages");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_48, 0);
-    lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
+    lv_label_set_text(title, "Parameters");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(title, lv_color_make(210, 20, 20), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 16, 8);
 
-    settings_mk_row(s_settings, 0, "Fin vert", &s_rpm_end_g, 1000, 7000, 100, 80);
-    settings_mk_row(s_settings, 1, "Fin jaune", &s_rpm_end_y, 2000, 7500, 100, 152);
-    settings_mk_row(s_settings, 2, "Regime max", &s_rpm_end_r, 3000, RPM_MAX_CAP, 100, 224);
-    settings_mk_row(s_settings, 3, "Eau max C", &s_ect_stop, 80, 130, 1, 296);
+    settings_mk_row(s_settings, 0, "Fin vert", &s_rpm_end_g, 1000, 7000, 100, 48);
+    settings_mk_row(s_settings, 1, "Fin jaune", &s_rpm_end_y, 2000, 7500, 100, 106);
+    settings_mk_row(s_settings, 2, "Regime max", &s_rpm_end_r, 3000, RPM_MAX_CAP, 100, 164);
+    settings_mk_row(s_settings, 3, "Eau max C", &s_ect_stop, 80, 130, 1, 222);
+    settings_mk_row(s_settings, 4, "Rideau ms", &s_red_blink_ms, RED_BLINK_MIN, RED_BLINK_MAX, RED_BLINK_STEP, 280);
+    settings_mk_row(s_settings, 5, "LED lum", &s_led_brightness, LED_BRIGHTNESS_MIN, LED_BRIGHTNESS_MAX,
+                    LED_BRIGHTNESS_STEP, 338);
 
     title = lv_label_create(s_settings);
     lv_label_set_text(title, "Barre LED");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_set_pos(title, 24, 368 + 12);
+    lv_obj_set_pos(title, 24, 396 + 12);
     s_leds_lbl = lv_label_create(s_settings);
     lv_obj_set_style_text_font(s_leds_lbl, &lv_font_montserrat_48, 0);
     lv_obj_set_style_text_color(s_leds_lbl, lv_color_white(), 0);
-    lv_obj_set_pos(s_leds_lbl, 320, 368);
+    lv_obj_set_pos(s_leds_lbl, 320, 396);
     settings_led_refresh();
-    settings_mk_btn(s_settings, "-", false, NULL, settings_led_cb, 520, 368);
-    settings_mk_btn(s_settings, "+", true, NULL, settings_led_cb, 620, 368);
+    settings_mk_btn(s_settings, "-", false, NULL, settings_led_cb, 520, 396);
+    settings_mk_btn(s_settings, "+", true, NULL, settings_led_cb, 620, 396);
 }
 
 static void dash_gesture_cb(lv_event_t *e)
@@ -823,6 +871,23 @@ static lv_obj_t *sep_line_create(lv_obj_t *parent, int32_t w, int32_t h, int32_t
     return line;
 }
 
+static void lambda_unit_cb(lv_event_t *e)
+{
+    (void)e;
+    s_show_afr = !s_show_afr;
+    if (s_lambda_title != NULL) {
+        lv_label_set_text(s_lambda_title, s_show_afr ? "AFR" : "Lambda");
+    }
+}
+
+static void lambda_bind_click(lv_obj_t *obj)
+{
+    lv_obj_set_clickable(obj, true);
+    dash_scroll_lock(obj);
+    lv_obj_set_ext_click_area(obj, 28);
+    lv_obj_add_event_cb(obj, lambda_unit_cb, LV_EVENT_CLICKED, NULL);
+}
+
 static lv_obj_t *metric_title_create(lv_obj_t *parent, const char *text, int32_t x_ofs)
 {
     lv_obj_t *title = lv_label_create(parent);
@@ -848,12 +913,23 @@ static lv_obj_t *metric_value_create(lv_obj_t *parent, const char *text, int32_t
     return value;
 }
 
+static lv_obj_t *s_splash_credit;
+static lv_obj_t *s_splash_version;
+
 static void splash_timer_cb(lv_timer_t *timer)
 {
     can_data_t data;
     lv_obj_t *logo = lv_timer_get_user_data(timer);
 
     lv_obj_delete(logo);
+    if (s_splash_credit) {
+        lv_obj_delete(s_splash_credit);
+        s_splash_credit = NULL;
+    }
+    if (s_splash_version) {
+        lv_obj_delete(s_splash_version);
+        s_splash_version = NULL;
+    }
     can_get_data(&data);
     s_rpm_shown = data.engine_valid ? data.rpm : 0;
     s_dash_ready = true;
@@ -883,11 +959,24 @@ static void lvgl_ui_init(void)
     s_rpm_green = rpm_band_create(screen, lv_color_make(0, 180, 40), 0);
     s_rpm_yellow = rpm_band_create(screen, lv_color_make(240, 190, 0), s_rpm_green_px);
     s_rpm_red = rpm_band_create(screen, lv_color_make(210, 20, 20), s_rpm_green_px + s_rpm_yellow_px);
-    lv_timer_create(rpm_curtain_timer_cb, 40, NULL);
+    /* Align with BOARD_UI_PERIOD_MS so curtain/RPM keep up with LVGL (~16 ms) without looking like ~10 fps. */
+    lv_timer_create(rpm_curtain_timer_cb, BOARD_UI_PERIOD_MS, NULL);
 
     lv_obj_t *logo = lv_image_create(screen);
     lv_image_set_src(logo, &toyota_logo);
     lv_obj_center(logo);
+
+    s_splash_credit = lv_label_create(screen);
+    lv_label_set_text(s_splash_credit, "By Alexis (2026)");
+    lv_obj_set_style_text_color(s_splash_credit, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_splash_credit, &lv_font_montserrat_28, 0);
+    lv_obj_align(s_splash_credit, LV_ALIGN_BOTTOM_RIGHT, -16, -16);
+
+    s_splash_version = lv_label_create(screen);
+    lv_label_set_text(s_splash_version, "v" APP_VERSION);
+    lv_obj_set_style_text_color(s_splash_version, lv_color_white(), 0);
+    lv_obj_set_style_text_font(s_splash_version, &lv_font_montserrat_28, 0);
+    lv_obj_align(s_splash_version, LV_ALIGN_BOTTOM_LEFT, 16, -16);
 
     lv_timer_t *splash = lv_timer_create(splash_timer_cb, 3000, logo);
     lv_timer_set_repeat_count(splash, 1);
@@ -898,7 +987,7 @@ static void lvgl_ui_init(void)
     lv_obj_set_style_text_opa(s_rpm_label, LV_OPA_COVER, 0);
     lv_obj_set_style_text_font(s_rpm_label, &rpm_font, 0);
     lv_obj_set_style_bg_opa(s_rpm_label, LV_OPA_TRANSP, 0);
-    lv_obj_align(s_rpm_label, LV_ALIGN_CENTER, -1, -64);
+    lv_obj_align(s_rpm_label, LV_ALIGN_CENTER, -1, -58);
     lv_obj_set_hidden(s_rpm_label, true);
 
     s_bottom_band = lv_obj_create(screen);
@@ -935,9 +1024,11 @@ static void lvgl_ui_init(void)
 
     s_lambda_title = metric_title_create(screen, "Lambda", -306);
     s_lambda_value = metric_value_create(screen, "-.--", -309);
-    s_air_title = metric_title_create(screen, "Air Motor", -102);
+    lambda_bind_click(s_lambda_title);
+    lambda_bind_click(s_lambda_value);
+    s_air_title = metric_title_create(screen, "Air Temp", -102);
     s_air_value = metric_value_create(screen, "--", -105);
-    s_tps_title = metric_title_create(screen, "Tps", 98);
+    s_tps_title = metric_title_create(screen, "TPS", 98);
     s_tps_value = metric_value_create(screen, "---", 102);
     s_ect_title = metric_title_create(screen, "Water", 303);
     s_ect_value = metric_value_create(screen, "---", 308);
@@ -972,7 +1063,7 @@ static void lvgl_ui_init(void)
     lv_obj_set_style_text_opa(s_stop_label, LV_OPA_COVER, 0);
 
     s_water_label = lv_label_create(s_stop_text);
-    lv_label_set_text(s_water_label, "WATER HIGH");
+    lv_label_set_text(s_water_label, "HOT WATER");
     lv_obj_set_style_text_font(s_water_label, &stop_font, 0);
     lv_obj_set_style_text_color(s_water_label, lv_color_white(), 0);
     lv_obj_set_style_text_opa(s_water_label, LV_OPA_COVER, 0);
@@ -1036,6 +1127,7 @@ void app_main(void)
     }
     settings_load();
     leds_init();
+    leds_set_brightness((uint8_t)s_led_brightness);
     leds_set_enabled(s_leds_enabled);
 
     esp_lcd_panel_handle_t panel = display_init();

@@ -5,8 +5,8 @@
 #include "esp_log.h"
 #include "led_strip.h"
 
-#define LED_BRIGHTNESS 25
-#define LED_TICK_MS 40
+#define LED_BRIGHTNESS_DEF 25
+#define LED_TICK_MS BOARD_UI_PERIOD_MS
 #define LED_BLINK_MAX_MS 80
 #define LED_BLINK_IDLE_MS 350
 #define LED_BLINK_TIMEOUT_MS 500
@@ -28,21 +28,30 @@ typedef enum {
     LED_MODE_IDLE,
     LED_MODE_BAR,
     LED_MODE_BLINK,
+    LED_MODE_PREVIEW,
 } led_mode_t;
 
 static const char *TAG = "leds";
 static led_strip_handle_t s_strip;
 static bool s_enabled;
+static bool s_preview;
+static uint8_t s_brightness = LED_BRIGHTNESS_DEF;
 static led_mode_t s_mode = LED_MODE_OFF;
 static uint32_t s_elapsed;
 static bool s_phase = true;
 static led_px_t s_frame[BOARD_LED_COUNT];
+static uint16_t s_last_rpm;
+static bool s_last_can_alive;
+static uint16_t s_last_green_end;
+static uint16_t s_last_yellow_end;
+static uint16_t s_last_red_end;
+static bool s_have_last_update;
 
 static void put(led_px_t *px, uint32_t color)
 {
-    px->r = (uint8_t)(((color >> 16) & 0xFF) * LED_BRIGHTNESS / 255);
-    px->g = (uint8_t)(((color >> 8) & 0xFF) * LED_BRIGHTNESS / 255);
-    px->b = (uint8_t)((color & 0xFF) * LED_BRIGHTNESS / 255);
+    px->r = (uint8_t)(((color >> 16) & 0xFF) * s_brightness / 255);
+    px->g = (uint8_t)(((color >> 8) & 0xFF) * s_brightness / 255);
+    px->b = (uint8_t)((color & 0xFF) * s_brightness / 255);
 }
 
 static void push(const led_px_t *px)
@@ -131,6 +140,8 @@ static void phase_tick(uint32_t period_ms)
     }
 }
 
+void leds_update(uint16_t rpm, bool can_alive, uint16_t green_end, uint16_t yellow_end, uint16_t red_end);
+
 esp_err_t leds_init(void)
 {
     const led_strip_config_t strip_config = {
@@ -163,7 +174,7 @@ void leds_set_enabled(bool enabled)
         return;
     }
     s_enabled = enabled;
-    if (s_strip == NULL) {
+    if (s_strip == NULL || s_preview) {
         return;
     }
     if (!enabled) {
@@ -175,13 +186,98 @@ void leds_set_enabled(bool enabled)
     push(px);
 }
 
+static void show_preview(void)
+{
+    led_px_t px[BOARD_LED_COUNT];
+    int i;
+
+    if (s_strip == NULL) {
+        return;
+    }
+    /* Barre complète : 4 vertes, 6 rouges, 6 bleues (pas de niveau régime). */
+    for (i = 0; i < 4; i++) {
+        put(&px[i], COLOR_GREEN);
+    }
+    for (i = 4; i < 10; i++) {
+        put(&px[i], COLOR_RED);
+    }
+    for (i = 10; i < BOARD_LED_COUNT; i++) {
+        put(&px[i], COLOR_BLUE);
+    }
+    s_mode = LED_MODE_PREVIEW;
+    push(px);
+}
+
+void leds_set_preview(bool preview)
+{
+    if (preview == s_preview) {
+        if (preview) {
+            show_preview();
+        }
+        return;
+    }
+    s_preview = preview;
+    if (s_strip == NULL) {
+        return;
+    }
+    if (preview) {
+        show_preview();
+        return;
+    }
+    memset(s_frame, 0xFF, sizeof(s_frame));
+    s_mode = LED_MODE_OFF;
+    s_elapsed = 0;
+    s_phase = true;
+    if (!s_enabled) {
+        blank();
+        return;
+    }
+    if (s_have_last_update) {
+        leds_update(s_last_rpm, s_last_can_alive, s_last_green_end, s_last_yellow_end, s_last_red_end);
+    }
+}
+
+void leds_set_brightness(uint8_t brightness)
+{
+    if (brightness < 1) {
+        brightness = 1;
+    }
+    if (brightness == s_brightness) {
+        return;
+    }
+    s_brightness = brightness;
+    /* Invalide le cache pour forcer un refresh avec le nouvel échelon. */
+    memset(s_frame, 0xFF, sizeof(s_frame));
+    if (s_preview) {
+        show_preview();
+        return;
+    }
+    if (s_enabled && s_have_last_update) {
+        leds_update(s_last_rpm, s_last_can_alive, s_last_green_end, s_last_yellow_end, s_last_red_end);
+    }
+}
+
 void leds_update(uint16_t rpm, bool can_alive, uint16_t green_end, uint16_t yellow_end, uint16_t red_end)
 {
     led_mode_t mode;
     led_px_t px[BOARD_LED_COUNT];
     uint32_t period = 0;
 
-    if (!s_enabled || s_strip == NULL) {
+    s_last_rpm = rpm;
+    s_last_can_alive = can_alive;
+    s_last_green_end = green_end;
+    s_last_yellow_end = yellow_end;
+    s_last_red_end = red_end;
+    s_have_last_update = true;
+
+    if (s_strip == NULL) {
+        return;
+    }
+    if (s_preview) {
+        show_preview();
+        return;
+    }
+    if (!s_enabled) {
         return;
     }
 
