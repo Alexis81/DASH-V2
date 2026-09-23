@@ -1,5 +1,6 @@
 #include "board.h"
 #include "can.h"
+#include "leds.h"
 #include "toyota_logo.h"
 
 #include <stdint.h>
@@ -23,6 +24,8 @@ extern const lv_font_t stop_font;
 
 static i2c_master_bus_handle_t s_i2c_bus;
 static esp_lcd_touch_handle_t s_touch;
+static esp_lcd_panel_handle_t s_panel;
+static bool s_settings_dirty;
 
 #define RPM_GREEN_DEF 4500
 #define RPM_YELLOW_DEF 6000
@@ -34,6 +37,7 @@ static esp_lcd_touch_handle_t s_touch;
 #define LAMBDA_RICH 0.95f
 #define LAMBDA_LEAN 1.2f
 #define STOP_BLINK_MS 500
+#define RED_BLINK_MS 80
 #define BOTTOM_BAND_H 120
 #define TITLE_BAND_Y ((BOARD_LCD_V_RES / 2) + 122)
 #define TITLE_BAND_H 39
@@ -72,6 +76,8 @@ static bool s_stop_active;
 static bool s_stop_lit = true;
 static bool s_settings_open;
 static uint32_t s_stop_elapsed;
+static uint32_t s_red_blink_elapsed;
+static bool s_red_blink_lit = true;
 static uint16_t s_rpm_drawn;
 static int16_t s_ect_drawn = INT16_MIN;
 static int16_t s_iat_drawn = INT16_MIN;
@@ -88,6 +94,8 @@ static uint16_t s_rpm_end_g = RPM_GREEN_DEF;
 static uint16_t s_rpm_end_y = RPM_YELLOW_DEF;
 static uint16_t s_rpm_end_r = RPM_MAX_DEF;
 static uint16_t s_ect_stop = ECT_STOP_DEF;
+static bool s_leds_enabled = true;
+static lv_obj_t *s_leds_lbl;
 static set_row_t s_set_rows[SET_ROW_COUNT];
 
 static int32_t rpm_span_px(uint16_t rpm, uint16_t rpm_start, uint16_t rpm_end, int32_t width)
@@ -137,6 +145,31 @@ static void rpm_curtain_apply(uint16_t rpm)
         lv_obj_align(s_rpm_label, LV_ALIGN_CENTER, -1, -64);
         lv_obj_move_foreground(s_rpm_label);
     }
+}
+
+/* Clignote uniquement la bande rouge quand le régime affiché atteint le max réglages. */
+static void rpm_red_blink_update(uint16_t rpm)
+{
+    bool on;
+
+    if (!s_dash_ready || s_stop_active || s_settings_open || s_rpm_red == NULL) {
+        return;
+    }
+
+    if (rpm < s_rpm_end_r) {
+        s_red_blink_elapsed = 0;
+        s_red_blink_lit = true;
+        lv_obj_set_hidden(s_rpm_red, false);
+        return;
+    }
+
+    s_red_blink_elapsed += 40;
+    on = (s_red_blink_elapsed / RED_BLINK_MS) % 2 == 0;
+    if (on == s_red_blink_lit) {
+        return;
+    }
+    s_red_blink_lit = on;
+    lv_obj_set_hidden(s_rpm_red, !on);
 }
 
 static lv_color_t ect_color(int16_t ect)
@@ -273,6 +306,8 @@ static void stop_engine_set(bool active)
     s_stop_active = active;
     s_stop_elapsed = 0;
     s_stop_lit = true;
+    s_red_blink_elapsed = 0;
+    s_red_blink_lit = true;
     lv_obj_set_hidden(s_stop_text, false);
     lv_obj_set_hidden(s_stop_overlay, !active);
     dash_set_hidden(active);
@@ -299,6 +334,37 @@ static bool stop_engine_needed(const can_data_t *data)
     return data->engine_valid && data->ect_c > (int16_t)s_ect_stop;
 }
 
+static bool s_scroll_fix;
+
+static void dash_scroll_back(lv_event_t *e)
+{
+    lv_obj_t *obj = lv_event_get_target(e);
+
+    if (s_scroll_fix) {
+        return;
+    }
+    if (lv_obj_get_scroll_x(obj) == 0 && lv_obj_get_scroll_y(obj) == 0) {
+        return;
+    }
+    s_scroll_fix = true;
+    lv_obj_scroll_to(obj, 0, 0, LV_ANIM_OFF);
+    s_scroll_fix = false;
+}
+
+static void dash_scroll_lock(lv_obj_t *obj)
+{
+    lv_obj_set_scrollable(obj, false);
+    lv_obj_set_scroll_dir(obj, LV_DIR_NONE);
+    lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_set_scroll_elastic(obj, false);
+    lv_obj_set_scroll_momentum(obj, false);
+    lv_obj_set_scroll_chain(obj, false);
+    lv_obj_set_scroll_on_focus(obj, false);
+    lv_obj_scroll_to(obj, 0, 0, LV_ANIM_OFF);
+}
+
+static void settings_save(void);
+
 static void settings_set_open(bool open)
 {
     can_data_t data;
@@ -306,8 +372,13 @@ static void settings_set_open(bool open)
     if (open == s_settings_open || s_settings == NULL) {
         return;
     }
+    dash_scroll_lock(lv_screen_active());
+    dash_scroll_lock(s_settings);
     s_settings_open = open;
     lv_obj_set_hidden(s_settings, !open);
+    if (!open && s_settings_dirty) {
+        settings_save();
+    }
     if (open) {
         lv_obj_move_foreground(s_settings);
         return;
@@ -324,6 +395,7 @@ static void settings_set_open(bool open)
     stop_engine_set(false);
     dash_set_hidden(false);
     rpm_curtain_apply(s_rpm_shown);
+    rpm_red_blink_update(s_rpm_shown);
     bottom_apply(&data);
     lv_obj_move_foreground(s_rpm_label);
 }
@@ -366,14 +438,21 @@ static void settings_save(void)
     nvs_set_u16(h, "y", s_rpm_end_y);
     nvs_set_u16(h, "r", s_rpm_end_r);
     nvs_set_u16(h, "e", s_ect_stop);
+    nvs_set_u8(h, "led", s_leds_enabled ? 1 : 0);
     nvs_commit(h);
     nvs_close(h);
+    s_settings_dirty = false;
+    /* L'écriture flash coupe le cache PSRAM : le LCD RGB se décale. On resynchronise. */
+    if (s_panel != NULL) {
+        esp_lcd_rgb_panel_restart(s_panel);
+    }
 }
 
 static void settings_load(void)
 {
     nvs_handle_t h;
     uint16_t v;
+    uint8_t led;
     if (nvs_open("dash", NVS_READONLY, &h) != ESP_OK) {
         return;
     }
@@ -388,6 +467,9 @@ static void settings_load(void)
     }
     if (nvs_get_u16(h, "e", &v) == ESP_OK) {
         s_ect_stop = v;
+    }
+    if (nvs_get_u8(h, "led", &led) == ESP_OK) {
+        s_leds_enabled = led != 0;
     }
     nvs_close(h);
     settings_clamp_ordered();
@@ -412,13 +494,17 @@ static void settings_btn_cb(lv_event_t *e)
         v = row->hi;
     }
     *row->val = (uint16_t)v;
+    dash_scroll_lock(lv_screen_active());
+    dash_scroll_lock(s_settings);
     settings_clamp_ordered();
     settings_rows_refresh();
-    settings_save();
+    s_settings_dirty = true;
     rpm_curtain_apply(s_rpm_shown);
+    rpm_red_blink_update(s_rpm_shown);
 }
 
-static lv_obj_t *settings_mk_btn(lv_obj_t *parent, const char *txt, bool plus, set_row_t *row, int32_t x, int32_t y)
+static lv_obj_t *settings_mk_btn(lv_obj_t *parent, const char *txt, bool plus, void *user, lv_event_cb_t cb, int32_t x,
+                               int32_t y)
 {
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_t *lab;
@@ -428,12 +514,14 @@ static lv_obj_t *settings_mk_btn(lv_obj_t *parent, const char *txt, bool plus, s
     lv_obj_set_style_radius(btn, 6, 0);
     lv_obj_set_style_bg_color(btn, lv_color_make(50, 50, 50), 0);
     lv_obj_set_user_data(btn, (void *)(uintptr_t)plus);
-    lv_obj_add_event_cb(btn, settings_btn_cb, LV_EVENT_CLICKED, row);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user);
+    dash_scroll_lock(btn);
     lab = lv_label_create(btn);
     lv_label_set_text(lab, txt);
     lv_obj_set_style_text_font(lab, &lv_font_montserrat_28, 0);
     lv_obj_set_style_text_color(lab, lv_color_white(), 0);
     lv_obj_center(lab);
+    dash_scroll_lock(lab);
     return btn;
 }
 
@@ -451,13 +539,35 @@ static void settings_mk_row(lv_obj_t *parent, int idx, const char *title, uint16
     lv_obj_set_style_text_font(t, &lv_font_montserrat_28, 0);
     lv_obj_set_style_text_color(t, lv_color_white(), 0);
     lv_obj_set_pos(t, 24, y + 12);
+    dash_scroll_lock(t);
     row->lbl = lv_label_create(parent);
     lv_obj_set_style_text_font(row->lbl, &lv_font_montserrat_48, 0);
     lv_obj_set_style_text_color(row->lbl, lv_color_white(), 0);
     lv_obj_set_pos(row->lbl, 320, y);
+    dash_scroll_lock(row->lbl);
     settings_row_refresh(row);
-    settings_mk_btn(parent, "-", false, row, 520, y);
-    settings_mk_btn(parent, "+", true, row, 620, y);
+    settings_mk_btn(parent, "-", false, row, settings_btn_cb, 520, y);
+    settings_mk_btn(parent, "+", true, row, settings_btn_cb, 620, y);
+}
+
+static void settings_led_refresh(void)
+{
+    if (s_leds_lbl != NULL) {
+        lv_label_set_text(s_leds_lbl, s_leds_enabled ? "Oui" : "Non");
+    }
+}
+
+static void settings_led_cb(lv_event_t *e)
+{
+    lv_obj_t *btn = (lv_obj_t *)lv_event_get_target(e);
+    const bool plus = (bool)(uintptr_t)lv_obj_get_user_data(btn);
+
+    s_leds_enabled = plus;
+    dash_scroll_lock(lv_screen_active());
+    dash_scroll_lock(s_settings);
+    settings_led_refresh();
+    s_settings_dirty = true;
+    leds_set_enabled(s_leds_enabled);
 }
 
 static void settings_build(lv_obj_t *screen)
@@ -472,19 +582,33 @@ static void settings_build(lv_obj_t *screen)
     lv_obj_set_style_radius(s_settings, 0, 0);
     lv_obj_set_style_pad_all(s_settings, 0, 0);
     lv_obj_set_style_text_color(s_settings, lv_color_white(), 0);
-    lv_obj_set_scrollable(s_settings, false);
+    dash_scroll_lock(s_settings);
+    lv_obj_add_event_cb(s_settings, dash_scroll_back, LV_EVENT_SCROLL, NULL);
     lv_obj_set_hidden(s_settings, true);
 
     title = lv_label_create(s_settings);
     lv_label_set_text(title, "Reglages");
     lv_obj_set_style_text_font(title, &lv_font_montserrat_48, 0);
     lv_obj_set_style_text_color(title, lv_color_white(), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 16);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
-    settings_mk_row(s_settings, 0, "Fin vert", &s_rpm_end_g, 1000, 7000, 100, 100);
-    settings_mk_row(s_settings, 1, "Fin jaune", &s_rpm_end_y, 2000, 7500, 100, 190);
-    settings_mk_row(s_settings, 2, "Regime max", &s_rpm_end_r, 3000, RPM_MAX_CAP, 100, 280);
-    settings_mk_row(s_settings, 3, "Eau max C", &s_ect_stop, 80, 130, 1, 370);
+    settings_mk_row(s_settings, 0, "Fin vert", &s_rpm_end_g, 1000, 7000, 100, 80);
+    settings_mk_row(s_settings, 1, "Fin jaune", &s_rpm_end_y, 2000, 7500, 100, 152);
+    settings_mk_row(s_settings, 2, "Regime max", &s_rpm_end_r, 3000, RPM_MAX_CAP, 100, 224);
+    settings_mk_row(s_settings, 3, "Eau max C", &s_ect_stop, 80, 130, 1, 296);
+
+    title = lv_label_create(s_settings);
+    lv_label_set_text(title, "Barre LED");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_28, 0);
+    lv_obj_set_style_text_color(title, lv_color_white(), 0);
+    lv_obj_set_pos(title, 24, 368 + 12);
+    s_leds_lbl = lv_label_create(s_settings);
+    lv_obj_set_style_text_font(s_leds_lbl, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(s_leds_lbl, lv_color_white(), 0);
+    lv_obj_set_pos(s_leds_lbl, 320, 368);
+    settings_led_refresh();
+    settings_mk_btn(s_settings, "-", false, NULL, settings_led_cb, 520, 368);
+    settings_mk_btn(s_settings, "+", true, NULL, settings_led_cb, 620, 368);
 }
 
 static void dash_gesture_cb(lv_event_t *e)
@@ -496,12 +620,12 @@ static void dash_gesture_cb(lv_event_t *e)
         return;
     }
     dir = lv_indev_get_gesture_dir(lv_indev_active());
+    lv_indev_wait_release(lv_indev_active());
     if (dir == LV_DIR_LEFT && !s_settings_open) {
         settings_set_open(true);
     } else if (dir == LV_DIR_RIGHT && s_settings_open) {
         settings_set_open(false);
     }
-    lv_indev_wait_release(lv_indev_active());
 }
 
 static void rpm_curtain_timer_cb(lv_timer_t *timer)
@@ -511,11 +635,16 @@ static void rpm_curtain_timer_cb(lv_timer_t *timer)
     uint16_t step;
 
     (void)timer;
-    if (!s_dash_ready || s_settings_open) {
+    if (!s_dash_ready) {
         return;
     }
 
     can_get_data(&data);
+    leds_update(data.engine_valid ? data.rpm : 0, can_is_alive(), s_rpm_end_g, s_rpm_end_y, s_rpm_end_r);
+    if (s_settings_open) {
+        return;
+    }
+
     if (stop_engine_needed(&data)) {
         stop_engine_set(true);
         stop_engine_blink();
@@ -540,6 +669,7 @@ static void rpm_curtain_timer_cb(lv_timer_t *timer)
     }
 
     rpm_curtain_apply(s_rpm_shown);
+    rpm_red_blink_update(s_rpm_shown);
 }
 
 static esp_err_t i2c_bus_init(void)
@@ -627,6 +757,7 @@ static esp_lcd_panel_handle_t display_init(void)
     };
 
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_config, &panel));
+    s_panel = panel;
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(panel));
     return panel;
@@ -732,6 +863,7 @@ static void splash_timer_cb(lv_timer_t *timer)
     }
     dash_set_hidden(false);
     rpm_curtain_apply(s_rpm_shown);
+    rpm_red_blink_update(s_rpm_shown);
     bottom_apply(&data);
     lv_obj_move_foreground(s_rpm_label);
 }
@@ -739,11 +871,13 @@ static void splash_timer_cb(lv_timer_t *timer)
 static void lvgl_ui_init(void)
 {
     lv_obj_t *screen = lv_screen_active();
+    dash_scroll_lock(screen);
+    lv_obj_add_event_cb(screen, dash_scroll_back, LV_EVENT_SCROLL, NULL);
     lv_obj_set_style_bg_color(screen, lv_color_black(), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
     lv_obj_set_style_text_color(screen, lv_color_white(), 0);
 
-    s_rpm_green_px = (BOARD_LCD_H_RES * 2) / 15;
+    s_rpm_green_px = BOARD_LCD_H_RES / 15;  /* 53 px, 1 cm sur 15 */
     s_rpm_yellow_px = s_rpm_green_px;
     s_rpm_red_px = BOARD_LCD_H_RES - s_rpm_green_px - s_rpm_yellow_px;
     s_rpm_green = rpm_band_create(screen, lv_color_make(0, 180, 40), 0);
@@ -877,6 +1011,7 @@ static void lvgl_init_display(esp_lcd_panel_handle_t panel, esp_lcd_touch_handle
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, lvgl_touch_read_cb);
     lv_indev_set_user_data(indev, touch);
+    lv_indev_set_scroll_limit(indev, 120);
     lv_indev_add_event_cb(indev, dash_gesture_cb, LV_EVENT_GESTURE, NULL);
 
     lvgl_ui_init();
@@ -900,6 +1035,8 @@ void app_main(void)
         nvs_flash_init();
     }
     settings_load();
+    leds_init();
+    leds_set_enabled(s_leds_enabled);
 
     esp_lcd_panel_handle_t panel = display_init();
     ESP_ERROR_CHECK(i2c_bus_init());

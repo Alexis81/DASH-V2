@@ -3,6 +3,7 @@
 
 #include <string.h>
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_twai.h"
 #include "esp_twai_onchip.h"
 #include "freertos/FreeRTOS.h"
@@ -21,10 +22,13 @@ typedef struct {
     uint8_t data[8];
 } can_frame_t;
 
+#define CAN_ALIVE_US 1000000
+
 static twai_node_handle_t s_node;
 static QueueHandle_t s_rx_queue;
 static portMUX_TYPE s_data_lock = portMUX_INITIALIZER_UNLOCKED;
 static can_data_t s_data;
+static int64_t s_last_rx_us;
 static volatile bool s_bus_off;
 
 static uint16_t read_be16(const uint8_t *data)
@@ -72,6 +76,7 @@ static void decode_frame(const can_frame_t *frame)
 
     taskENTER_CRITICAL(&s_data_lock);
     s_data = next;
+    s_last_rx_us = esp_timer_get_time();
     taskEXIT_CRITICAL(&s_data_lock);
 }
 
@@ -147,6 +152,19 @@ void can_get_data(can_data_t *out)
     taskENTER_CRITICAL(&s_data_lock);
     *out = s_data;
     taskEXIT_CRITICAL(&s_data_lock);
+}
+
+bool can_is_alive(void)
+{
+    int64_t last;
+
+    taskENTER_CRITICAL(&s_data_lock);
+    last = s_last_rx_us;
+    taskEXIT_CRITICAL(&s_data_lock);
+    if (last == 0) {
+        return false;
+    }
+    return (esp_timer_get_time() - last) < CAN_ALIVE_US;
 }
 
 esp_err_t can_start(void)

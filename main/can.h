@@ -31,3 +31,4 @@ typedef struct {
 
 esp_err_t can_start(void);
 void can_get_data(can_data_t *out);
+bool can_is_alive(void);
